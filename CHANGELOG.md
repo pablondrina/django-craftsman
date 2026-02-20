@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-02-20
+
+### Fixed
+- `_calculate_material_requirements()` referenced `inp.input_product` instead of `inp.item` (GenericForeignKey), causing `AttributeError` when calling `craft.start()`.
+
 ## [0.1.0] - 2025-01-20
 
 ### Added

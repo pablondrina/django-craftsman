@@ -760,7 +760,7 @@ class Craft:
         for inp in recipe.items.filter(is_active=True):
             requirements.append(
                 {
-                    "product": inp.input_product,
+                    "product": inp.item,
                     "quantity": inp.quantity * multiplier,
                     "position": inp.position,
                 }
