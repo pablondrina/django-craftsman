@@ -22,16 +22,17 @@ from django.contrib.contenttypes.models import ContentType
 from django.shortcuts import redirect
 from django.urls import reverse
 from django.utils import timezone
-from django.utils.html import format_html
 from django.utils.translation import gettext_lazy as _
 from unfold.decorators import display
 
-from craftsman.contrib.admin_unfold.base import (
+from shopman_commons.contrib.admin_unfold.badges import unfold_badge, unfold_badge_numeric
+from shopman_commons.contrib.admin_unfold.base import (
     BaseModelAdmin,
     BaseStackedInline,
     BaseTabularInline,
-    format_quantity,
 )
+from shopman_commons.formatting import format_quantity
+
 from craftsman.models import (
     IngredientCategory,
     Plan,
@@ -46,41 +47,32 @@ from craftsman.models import (
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# HELPERS
-# =============================================================================
+def _position_model_has_admin():
+    """Check if the configured Position model has a registered admin."""
+    from craftsman.conf import get_position_model
+
+    try:
+        return admin.site.is_registered(get_position_model())
+    except Exception:
+        return False
 
 
-def _unfold_badge(text, color="base"):
-    """Create Unfold badge with colored background."""
-    base_classes = "inline-block font-semibold h-6 leading-6 px-2 rounded-default whitespace-nowrap text-xs uppercase"
+class _SafeAutocompleteMixin:
+    """
+    Mixin that adds Position-FK fields to autocomplete_fields at runtime,
+    only if the configured Position model has a registered ModelAdmin.
 
-    color_classes = {
-        "base": "bg-base-100 text-base-700 dark:bg-base-500/20 dark:text-base-200",
-        "red": "bg-red-100 text-red-700 dark:bg-red-500/20 dark:text-red-400",
-        "green": "bg-green-100 text-green-700 dark:bg-green-500/20 dark:text-green-400",
-        "yellow": "bg-yellow-100 text-yellow-700 dark:bg-yellow-500/20 dark:text-yellow-400",
-        "blue": "bg-blue-100 text-blue-700 dark:bg-blue-500/20 dark:text-blue-400",
-    }
+    Fields referencing Position must be listed in `_position_autocomplete_fields`
+    instead of `autocomplete_fields` to avoid admin.E039 at check time.
+    """
 
-    classes = f"{base_classes} {color_classes.get(color, color_classes['base'])}"
-    return format_html('<span class="{}">{}</span>', classes, text)
+    _position_autocomplete_fields = ()
 
-
-def _unfold_badge_numeric(text, color="base"):
-    """Create Unfold badge for numeric values (normal font size, no uppercase)."""
-    base_classes = "inline-block font-semibold h-6 leading-6 px-2 rounded-default whitespace-nowrap"
-
-    color_classes = {
-        "base": "bg-base-100 text-base-700 dark:bg-base-500/20 dark:text-base-200",
-        "red": "bg-red-100 text-red-700 dark:bg-red-500/20 dark:text-red-400",
-        "green": "bg-green-100 text-green-700 dark:bg-green-500/20 dark:text-green-400",
-        "yellow": "bg-yellow-100 text-yellow-700 dark:bg-yellow-500/20 dark:text-yellow-400",
-        "blue": "bg-blue-100 text-blue-700 dark:bg-blue-500/20 dark:text-blue-400",
-    }
-
-    classes = f"{base_classes} {color_classes.get(color, color_classes['base'])}"
-    return format_html('<span class="{}">{}</span>', classes, text)
+    def get_autocomplete_fields(self, request):
+        fields = list(super().get_autocomplete_fields(request))
+        if _position_model_has_admin():
+            fields.extend(self._position_autocomplete_fields)
+        return fields
 
 
 # =============================================================================
@@ -88,7 +80,7 @@ def _unfold_badge_numeric(text, color="base"):
 # =============================================================================
 
 
-class RecipeItemInline(BaseStackedInline):
+class RecipeItemInline(_SafeAutocompleteMixin, BaseStackedInline):
     """Inline for recipe items (insumos).
 
     Usa StackedInline para melhor organização dos muitos campos.
@@ -97,7 +89,8 @@ class RecipeItemInline(BaseStackedInline):
 
     model = RecipeItem
     extra = 0
-    autocomplete_fields = ["position", "category"]
+    autocomplete_fields = ["category"]
+    _position_autocomplete_fields = ("position",)
 
     # Unfold: inlines colapsáveis (cada item pode ser expandido/colapsado)
     tab = True
@@ -144,7 +137,7 @@ class IngredientCategoryAdmin(BaseModelAdmin):
 
 
 @admin.register(Recipe)
-class RecipeAdmin(BaseModelAdmin):
+class RecipeAdmin(_SafeAutocompleteMixin, BaseModelAdmin):
     """Admin interface for Recipe."""
 
     # Unfold options
@@ -163,7 +156,8 @@ class RecipeAdmin(BaseModelAdmin):
     search_fields = ["code", "name"]
     ordering = ["name"]
     prepopulated_fields = {"code": ("name",)}
-    autocomplete_fields = ["work_center"]
+    autocomplete_fields = []
+    _position_autocomplete_fields = ("work_center",)
 
     inlines = [RecipeItemInline]
 
@@ -221,13 +215,14 @@ class RecipeAdmin(BaseModelAdmin):
 # =============================================================================
 
 
-class PlanItemInline(BaseTabularInline):
+class PlanItemInline(_SafeAutocompleteMixin, BaseTabularInline):
     """Inline for plan items."""
 
     model = PlanItem
     extra = 0
     fields = ["recipe", "quantity", "destination", "priority"]
-    autocomplete_fields = ["recipe", "destination"]
+    autocomplete_fields = ["recipe"]
+    _position_autocomplete_fields = ("destination",)
     readonly_fields = []
 
 
@@ -292,14 +287,14 @@ class PlanAdmin(BaseModelAdmin):
             PlanStatus.COMPLETED: "green",
         }
         color = colors.get(obj.status, "base")
-        return _unfold_badge(obj.get_status_display(), color)
+        return unfold_badge(obj.get_status_display(), color)
 
     @display(description=_("Qtd Total"))
     def total_quantity_display(self, obj):
         """Display total quantity."""
         total = obj.total_quantity
         if total > 0:
-            return _unfold_badge_numeric(format_quantity(total), "base")
+            return unfold_badge_numeric(format_quantity(total), "base")
         return "-"
 
 
@@ -309,7 +304,7 @@ class PlanAdmin(BaseModelAdmin):
 
 
 @admin.register(PlanItem)
-class PlanItemAdmin(BaseModelAdmin):
+class PlanItemAdmin(_SafeAutocompleteMixin, BaseModelAdmin):
     """
     Admin de Planejamento (estilo Batch).
 
@@ -334,7 +329,8 @@ class PlanItemAdmin(BaseModelAdmin):
     list_editable = ["quantity"]
     date_hierarchy = "plan__date"
     ordering = ["-plan__date", "recipe__name"]
-    autocomplete_fields = ["recipe", "destination"]
+    autocomplete_fields = ["recipe"]
+    _position_autocomplete_fields = ("destination",)
 
     # Unfold options
     compressed_fields = True
@@ -378,7 +374,7 @@ class PlanItemAdmin(BaseModelAdmin):
         """Display suggested quantity based on holds."""
         suggested = obj.get_suggested_quantity()
         if suggested > 0:
-            return _unfold_badge_numeric(format_quantity(suggested), "yellow")
+            return unfold_badge_numeric(format_quantity(suggested), "yellow")
         return "-"
 
     @display(description=_("Produzido"))
@@ -386,7 +382,7 @@ class PlanItemAdmin(BaseModelAdmin):
         """Display produced quantity."""
         produced = obj.total_produced
         if produced > 0:
-            return _unfold_badge_numeric(format_quantity(produced), "green")
+            return unfold_badge_numeric(format_quantity(produced), "green")
         return "-"
 
     @display(description=_("Reservado"))
@@ -394,7 +390,7 @@ class PlanItemAdmin(BaseModelAdmin):
         """Display reserved quantity (from Stockman holds)."""
         reserved = obj.get_reserved_quantity()
         if reserved > 0:
-            return _unfold_badge_numeric(format_quantity(reserved), "yellow")
+            return unfold_badge_numeric(format_quantity(reserved), "yellow")
         return "-"
 
     @display(description=_("Disponivel"))
@@ -403,14 +399,14 @@ class PlanItemAdmin(BaseModelAdmin):
         available = obj.get_available_quantity()
 
         if available > 0:
-            return _unfold_badge_numeric(format_quantity(available), "green")
+            return unfold_badge_numeric(format_quantity(available), "green")
         elif available == 0:
             produced = obj.total_produced
             if produced > 0:
-                return _unfold_badge_numeric("0", "yellow")
+                return unfold_badge_numeric("0", "yellow")
             return "-"
         else:
-            return _unfold_badge_numeric(f"{format_quantity(available)}", "red")
+            return unfold_badge_numeric(f"{format_quantity(available)}", "red")
 
     @display(description=_("Status"))
     def status_badge(self, obj):
@@ -419,13 +415,13 @@ class PlanItemAdmin(BaseModelAdmin):
         quantity = obj.quantity
 
         if produced >= quantity and quantity > 0:
-            return _unfold_badge("Concluido", "green")
+            return unfold_badge("Concluido", "green")
         elif produced > 0:
-            return _unfold_badge("Em Producao", "yellow")
+            return unfold_badge("Em Producao", "yellow")
         elif quantity > 0:
-            return _unfold_badge("Planejado", "blue")
+            return unfold_badge("Planejado", "blue")
         else:
-            return _unfold_badge("Pendente", "base")
+            return unfold_badge("Pendente", "base")
 
     def changelist_view(self, request, extra_context=None):
         """
@@ -476,8 +472,13 @@ class PlanItemAdmin(BaseModelAdmin):
 
     def _auto_create_plan_items(self, target_date: date):
         """Auto-create PlanItems for products with active recipes."""
-        from offerman.models import Product
-        from stockman.models import Position
+        from craftsman.conf import get_position_model
+
+        try:
+            from offerman.models import Product
+        except ImportError:
+            logger.debug("offerman not installed, skipping auto-create PlanItems")
+            return
 
         try:
             # Get or create Plan for this date
@@ -486,7 +487,8 @@ class PlanItemAdmin(BaseModelAdmin):
             )
 
             # Get default destination
-            destination = Position.objects.filter(is_default=True).first()
+            PositionModel = get_position_model()
+            destination = PositionModel.objects.filter(is_default=True).first()
 
             # Get active recipes for batch-produced products
             product_ct = ContentType.objects.get_for_model(Product)
@@ -551,7 +553,7 @@ class PlanItemAdmin(BaseModelAdmin):
 
 
 @admin.register(WorkOrder)
-class WorkOrderAdmin(BaseModelAdmin):
+class WorkOrderAdmin(_SafeAutocompleteMixin, BaseModelAdmin):
     """
     Admin de Execucao (estilo Batch).
 
@@ -564,8 +566,8 @@ class WorkOrderAdmin(BaseModelAdmin):
         "product_display",
         "date_display",
         "planned_quantity",
-        "processed_quantity",
-        "produced_quantity",
+        "process_quantity",
+        "output_quantity",
         "loss_display",
         "status_badge",
     ]
@@ -574,18 +576,17 @@ class WorkOrderAdmin(BaseModelAdmin):
     search_fields = ["code", "recipe__name"]
     list_editable = [
         "planned_quantity",
-        "processed_quantity",
-        "produced_quantity",
+        "process_quantity",
+        "output_quantity",
     ]
     date_hierarchy = "scheduled_start"
     ordering = ["-created_at"]
     autocomplete_fields = [
         "recipe",
-        "destination",
-        "location",
         "assigned_to",
         "plan_item",
     ]
+    _position_autocomplete_fields = ("destination", "location")
 
     # Unfold options
     compressed_fields = True
@@ -604,8 +605,8 @@ class WorkOrderAdmin(BaseModelAdmin):
                 "classes": ["tab"],
                 "fields": (
                     "planned_quantity",
-                    "processed_quantity",
-                    "produced_quantity",
+                    "process_quantity",
+                    "output_quantity",
                     "actual_quantity",
                 ),
             },
@@ -676,16 +677,16 @@ class WorkOrderAdmin(BaseModelAdmin):
 
         loss = obj.loss_quantity
         if loss is None or loss == 0:
-            return _unfold_badge_numeric("0", "green")
+            return unfold_badge_numeric("0", "green")
 
         pct = obj.loss_percentage
         loss_formatted = format_quantity(loss)
         if pct and pct > 10:
-            return _unfold_badge_numeric(f"{loss_formatted} ({pct:.1f}%)", "red")
+            return unfold_badge_numeric(f"{loss_formatted} ({pct:.1f}%)", "red")
         elif pct and pct > 5:
-            return _unfold_badge_numeric(f"{loss_formatted} ({pct:.1f}%)", "yellow")
+            return unfold_badge_numeric(f"{loss_formatted} ({pct:.1f}%)", "yellow")
         else:
-            return _unfold_badge_numeric(loss_formatted, "base")
+            return unfold_badge_numeric(loss_formatted, "base")
 
     @display(description=_("Status"))
     def status_badge(self, obj):
@@ -698,7 +699,7 @@ class WorkOrderAdmin(BaseModelAdmin):
             WorkOrderStatus.CANCELLED: "red",
         }
         color = colors.get(obj.status, "base")
-        return _unfold_badge(obj.get_status_display(), color)
+        return unfold_badge(obj.get_status_display(), color)
 
     def get_readonly_fields(self, request, obj=None):
         """Make code readonly only for existing objects."""
@@ -753,10 +754,10 @@ class WorkOrderAdmin(BaseModelAdmin):
             # Check if any step field was set (transition to IN_PROGRESS)
             step_fields_changed = any(
                 [
-                    obj.processed_quantity is not None
-                    and old_obj.processed_quantity is None,
-                    obj.produced_quantity is not None
-                    and old_obj.produced_quantity is None,
+                    obj.process_quantity is not None
+                    and old_obj.process_quantity is None,
+                    obj.output_quantity is not None
+                    and old_obj.output_quantity is None,
                 ]
             )
 
@@ -780,16 +781,16 @@ class WorkOrderAdmin(BaseModelAdmin):
 
                     logger.info(f"WorkOrder {obj.code} completed via admin")
 
-            # Auto-complete if produced_quantity (last step) was set and actual_quantity is empty
-            if obj.produced_quantity is not None and old_obj.produced_quantity is None:
+            # Auto-complete if output_quantity (last step) was set and actual_quantity is empty
+            if obj.output_quantity is not None and old_obj.output_quantity is None:
                 if obj.actual_quantity is None:
-                    obj.actual_quantity = obj.produced_quantity
+                    obj.actual_quantity = obj.output_quantity
                     obj.status = WorkOrderStatus.COMPLETED
                     obj.completed_at = timezone.now()
                     if "completed_by" not in obj.metadata:
                         obj.metadata["completed_by"] = request.user.username
                     logger.info(
-                        f"WorkOrder {obj.code} auto-completed via produced_quantity"
+                        f"WorkOrder {obj.code} auto-completed via output_quantity"
                     )
 
         super().save_model(request, obj, form, change)

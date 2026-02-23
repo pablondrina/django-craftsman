@@ -13,11 +13,14 @@ from decimal import Decimal
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Avg, Count, Sum
+from django.db.models.functions import ExtractIsoWeekDay
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from simple_history.models import HistoricalRecords
+
+from craftsman.conf import get_position_model_string
 
 logger = logging.getLogger(__name__)
 
@@ -65,18 +68,18 @@ class Plan(models.Model):
     )
 
     # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    approved_at = models.DateTimeField(null=True, blank=True)
-    scheduled_at = models.DateTimeField(null=True, blank=True)
-    completed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=_("criado em"))
+    approved_at = models.DateTimeField(null=True, blank=True, verbose_name=_("aprovado em"))
+    scheduled_at = models.DateTimeField(null=True, blank=True, verbose_name=_("agendado em"))
+    completed_at = models.DateTimeField(null=True, blank=True, verbose_name=_("concluído em"))
 
     # History
     history = HistoricalRecords()
 
     class Meta:
         db_table = "craftsman_plan"
-        verbose_name = _("Plano de Produção")
-        verbose_name_plural = _("Planos de Produção")
+        verbose_name = _("Planejamento")
+        verbose_name_plural = _("Planejamentos")
         ordering = ["-date"]
 
     def __str__(self) -> str:
@@ -102,37 +105,65 @@ class Plan(models.Model):
             },
         )
 
-    def schedule(self, user=None):
-        """Agenda plano (cria WorkOrders)."""
+    def schedule(self, user=None, reserve_inputs=None, start_time=None, location=None):
+        """
+        Agenda plano (cria WorkOrders).
+
+        Args:
+            user: User who scheduled
+            reserve_inputs: If True, reserve materials via StockBackend.
+                If None, uses CRAFTSMAN['RESERVE_INPUTS'] setting.
+            start_time: Override start time for all WorkOrders
+            location: Override location for all WorkOrders
+        """
         if self.status != PlanStatus.APPROVED:
             raise ValidationError(_("Apenas planos aprovados podem ser agendados."))
 
+        from craftsman.conf import get_setting
+
+        if reserve_inputs is None:
+            reserve_inputs = get_setting("RESERVE_INPUTS", False)
+
         from craftsman.models.work_order import WorkOrder, WorkOrderStatus
 
-        work_orders = []
+        with transaction.atomic():
+            work_orders = []
 
-        for item in self.items.all():
-            # Calculate scheduled_start based on lead_time_days
-            lead_time = item.recipe.lead_time_days or 0
-            scheduled_start = None
-            if lead_time > 0:
-                # Production starts lead_time days before plan date, at 6:00 AM
-                start_date = self.date - timedelta(days=lead_time)
-                scheduled_start = datetime.combine(start_date, time(6, 0))
+            for item in self.items.select_related("recipe").all():
+                if item.quantity <= 0:
+                    continue
 
-            wo = WorkOrder.objects.create(
-                plan_item=item,
-                recipe=item.recipe,
-                planned_quantity=item.quantity,
-                status=WorkOrderStatus.PENDING,
-                destination=item.destination,
-                scheduled_start=scheduled_start,
-            )
-            work_orders.append(wo)
+                # Determine scheduled_start
+                if start_time:
+                    scheduled_start = datetime.combine(self.date, start_time)
+                    if timezone.is_naive(scheduled_start):
+                        scheduled_start = timezone.make_aware(scheduled_start)
+                else:
+                    lead_time = item.recipe.lead_time_days or 0
+                    scheduled_start = None
+                    if lead_time > 0:
+                        start_date = self.date - timedelta(days=lead_time)
+                        scheduled_start = datetime.combine(start_date, time(6, 0))
 
-        self.status = PlanStatus.SCHEDULED
-        self.scheduled_at = timezone.now()
-        self.save(update_fields=["status", "scheduled_at"])
+                wo = WorkOrder.objects.create(
+                    plan_item=item,
+                    recipe=item.recipe,
+                    planned_quantity=item.quantity,
+                    status=WorkOrderStatus.PENDING,
+                    destination=item.destination,
+                    location=location or item.recipe.work_center,
+                    scheduled_start=scheduled_start,
+                    created_by=f"user:{user.username}" if user else "system:scheduler",
+                    metadata={
+                        "scheduled_by": user.username if user else None,
+                        "reservation_mode": "enabled" if reserve_inputs else "disabled",
+                    },
+                )
+                work_orders.append(wo)
+
+            self.status = PlanStatus.SCHEDULED
+            self.scheduled_at = timezone.now()
+            self.save(update_fields=["status", "scheduled_at"])
 
         logger.info(
             f"Plan {self.date} scheduled with {len(work_orders)} work orders",
@@ -200,9 +231,9 @@ class PlanItem(models.Model):
         help_text=_("Quantidade aprovada para produzir"),
     )
 
-    # Destination (Position where product will be delivered)
+    # Destination (where product will be delivered)
     destination = models.ForeignKey(
-        "stockman.Position",
+        get_position_model_string(),
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -222,8 +253,8 @@ class PlanItem(models.Model):
         verbose_name=_("Observações"),
     )
 
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=_("criado em"))
+    updated_at = models.DateTimeField(auto_now=True, verbose_name=_("atualizado em"))
 
     class Meta:
         db_table = "craftsman_plan_item"
@@ -309,56 +340,43 @@ class PlanItem(models.Model):
         """
         Calculate suggested quantity based on:
         1. Historical average (production from past N days)
-        2. Holds (customer orders/reservations)
+        2. Committed demand (via DemandBackend, if configured)
         3. Safety stock percentage
 
-        Formula: (historical_avg + holds) * (1 + safety%)
+        Formula: (historical_avg + committed) * (1 + safety%)
         """
+        from craftsman.conf import get_demand_backend, get_setting
+
         try:
-            from constance import config
-
-            from stockman.models import Hold, HoldStatus
-
             product = self.recipe.output_product
             if not product:
                 return Decimal("0")
 
-            ct = ContentType.objects.get_for_model(product)
-
-            # Get config values (with fallback)
-            try:
-                safety_percent = (
-                    Decimal(str(config.PRODUCTION_SAFETY_STOCK_PERCENT)) / 100
-                )
-                historical_days = config.PRODUCTION_HISTORICAL_DAYS
-                same_weekday = config.PRODUCTION_SAME_WEEKDAY_ONLY
-            except Exception:
-                safety_percent = Decimal("0.20")
-                historical_days = 28
-                same_weekday = True
+            safety_percent = get_setting("SAFETY_STOCK_PERCENT", Decimal("0.20"))
+            historical_days = get_setting("HISTORICAL_DAYS", 28)
+            same_weekday = get_setting("SAME_WEEKDAY_ONLY", True)
 
             # 1. Calculate historical average
             historical_avg = self._get_historical_average(
                 days=historical_days, same_weekday=same_weekday
             )
 
-            # 2. Get active holds for this date
-            holds_total = Hold.objects.filter(
-                content_type=ct,
-                object_id=product.pk,
-                target_date=self.plan.date,
-                status=HoldStatus.PENDING,
-            ).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
+            # 2. Get committed demand (holds/reservations)
+            committed = Decimal("0")
+            demand_backend = get_demand_backend()
+            if demand_backend:
+                committed = demand_backend.committed(product, self.plan.date)
 
-            # 3. Base = historical + holds
-            base_quantity = historical_avg + holds_total
+            # 3. Base = historical + committed
+            base_quantity = historical_avg + committed
 
             # 4. Apply safety stock
             suggested = base_quantity * (1 + safety_percent)
 
             return suggested.quantize(Decimal("0.01"))
 
-        except Exception:
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.warning("get_suggested_quantity failed for PlanItem %s: %s", self.pk, exc)
             return Decimal("0")
 
     def _get_historical_average(
@@ -390,13 +408,14 @@ class PlanItem(models.Model):
 
         # Filter by date range
         if same_weekday:
-            # Only same weekday (e.g., if target is Friday, only past Fridays)
-            target_weekday = target_date.weekday()
-            qs = qs.filter(
+            # ISO weekday: Mon=1..Sun=7 (matches date.isoweekday())
+            target_iso_weekday = target_date.isoweekday()
+            qs = qs.annotate(
+                plan_iso_weekday=ExtractIsoWeekDay("plan_item__plan__date")
+            ).filter(
                 plan_item__plan__date__gte=start_date,
                 plan_item__plan__date__lt=target_date,
-                plan_item__plan__date__week_day=target_weekday
-                + 2,  # Django uses 1=Sunday
+                plan_iso_weekday=target_iso_weekday,
             )
         else:
             qs = qs.filter(
@@ -417,17 +436,22 @@ class PlanItem(models.Model):
         return Decimal(str(avg))
 
     def get_reserved_quantity(self) -> Decimal:
-        """Get reserved quantity (from Stockman holds)."""
-        try:
-            from stockman import stock
+        """Get reserved/committed quantity (via DemandBackend)."""
+        from craftsman.conf import get_demand_backend
 
+        try:
             product = self.recipe.output_product
             if not product:
                 return Decimal("0")
 
-            return stock.committed(product, self.plan.date)
+            demand_backend = get_demand_backend()
+            if not demand_backend:
+                return Decimal("0")
 
-        except Exception:
+            return demand_backend.committed(product, self.plan.date)
+
+        except (AttributeError, TypeError) as exc:
+            logger.debug("get_reserved_quantity unavailable for PlanItem %s: %s", self.pk, exc)
             return Decimal("0")
 
     def get_available_quantity(self) -> Decimal:

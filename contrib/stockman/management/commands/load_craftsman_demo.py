@@ -36,6 +36,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         from offerman.models import Product
+        from stockman.models import Hold, HoldStatus, Position
 
         from craftsman.models import (
             Plan,
@@ -46,7 +47,6 @@ class Command(BaseCommand):
             WorkOrder,
             WorkOrderStatus,
         )
-        from stockman.models import Hold, HoldStatus, Position
 
         self.stdout.write("=" * 60)
         self.stdout.write("🍞 Carregando dados de demonstração do Craftsman v2.3...")

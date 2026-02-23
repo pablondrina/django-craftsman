@@ -4,6 +4,7 @@ Craftsman API ViewSets.
 
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from craftsman.models import Recipe, Plan, WorkOrder
@@ -24,6 +25,7 @@ class RecipeViewSet(viewsets.ReadOnlyModelViewSet):
     retrieve: Get a specific recipe by UUID
     """
 
+    permission_classes = [IsAuthenticated]
     queryset = Recipe.objects.filter(is_active=True)
     serializer_class = RecipeSerializer
     lookup_field = "uuid"
@@ -42,6 +44,7 @@ class PlanViewSet(viewsets.ModelViewSet):
     schedule: Schedule an approved plan (creates WorkOrders)
     """
 
+    permission_classes = [IsAuthenticated]
     queryset = Plan.objects.all()
     serializer_class = PlanSerializer
 
@@ -99,6 +102,7 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
     complete: Complete the work order
     """
 
+    permission_classes = [IsAuthenticated]
     queryset = WorkOrder.objects.all()
     serializer_class = WorkOrderSerializer
     lookup_field = "uuid"

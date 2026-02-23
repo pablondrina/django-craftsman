@@ -14,6 +14,5 @@ class CraftsmanConfig(AppConfig):
     verbose_name = _("Produção")
 
     def ready(self):
-        """Import signal handlers when app is ready."""
-        # Import handlers to register them
-        from craftsman.signals import handlers  # noqa: F401
+        """App ready hook. Signal handlers registered by contrib apps."""
+        pass

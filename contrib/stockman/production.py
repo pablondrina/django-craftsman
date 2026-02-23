@@ -12,6 +12,7 @@ Vocabulary mapping (Stockman → Craftsman):
 """
 
 import logging
+import threading
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -20,6 +21,7 @@ from django.contrib.contenttypes.models import ContentType
 logger = logging.getLogger(__name__)
 
 # Singleton instance
+_lock = threading.Lock()
 _production_backend = None
 
 
@@ -348,11 +350,12 @@ class CraftsmanProductionBackend:
         return results
 
     def _get_product_by_sku(self, sku: str):
-        """Get product by SKU from Offerman."""
+        """Get product by SKU via ProductInfoBackend."""
         try:
-            from offerman.models import Product
+            from craftsman.adapters.offerman import get_product_info_backend
 
-            return Product.objects.get(sku=sku)
+            backend = get_product_info_backend()
+            return backend.get_product_info(sku)
         except Exception:
             return None
 
@@ -369,7 +372,9 @@ def get_production_backend() -> CraftsmanProductionBackend:
     """
     global _production_backend
     if _production_backend is None:
-        _production_backend = CraftsmanProductionBackend()
+        with _lock:
+            if _production_backend is None:  # double-checked
+                _production_backend = CraftsmanProductionBackend()
     return _production_backend
 
 

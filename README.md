@@ -176,6 +176,20 @@ for record in work_order.history.all():
     print(f"{record.history_date}: {record.status}")
 ```
 
+## Shopman Suite
+
+Craftsman is part of the [Shopman suite](https://github.com/pablondrina). The admin UI uses shared utilities from [django-shopman-commons](https://github.com/pablondrina/django-shopman-commons):
+
+- `BaseModelAdmin`, `BaseTabularInline`, `BaseStackedInline` — textarea-aware admin classes for Unfold
+- `unfold_badge`, `unfold_badge_numeric` — colored badge helpers
+- `format_quantity` — decimal formatting
+
+```python
+from shopman_commons.contrib.admin_unfold.base import BaseModelAdmin, BaseTabularInline, BaseStackedInline
+from shopman_commons.contrib.admin_unfold.badges import unfold_badge, unfold_badge_numeric
+from shopman_commons.formatting import format_quantity
+```
+
 ## Requirements
 
 - Python 3.11+

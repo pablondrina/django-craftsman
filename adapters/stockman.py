@@ -14,6 +14,7 @@ Vocabulary mapping:
 """
 
 import logging
+import threading
 from decimal import Decimal
 from typing import Any, Callable
 
@@ -67,23 +68,22 @@ class StockmanBackend:
         self._product_resolver = product_resolver
 
     def _get_product(self, sku: str):
-        """Resolve SKU para produto."""
+        """Resolve SKU to product."""
         if self._product_resolver:
             return self._product_resolver(sku)
 
-        # Resolver padrão - tenta encontrar em models comuns
+        # Use ProductInfoBackend if configured
         try:
-            # Tenta omniman.Listing primeiro
-            from omniman.models import Listing
+            from craftsman.adapters.offerman import get_product_info_backend
 
-            listing = Listing.objects.filter(sku=sku).first()
-            if listing:
-                return listing.product
-        except ImportError:
+            backend = get_product_info_backend()
+            info = backend.get_product_info(sku)
+            if info:
+                return info
+        except Exception:
             pass
 
-        # Fallback: retorna None se não encontrar
-        logger.warning(f"Could not resolve product for SKU: {sku}")
+        logger.warning("Could not resolve product for SKU: %s", sku)
         return None
 
     def _get_stock(self):
@@ -357,6 +357,7 @@ class StockmanBackend:
             )
 
         released = []
+        failed = []
         for hold in holds:
             try:
                 sku = getattr(hold.product, "sku", str(hold.product))
@@ -370,10 +371,13 @@ class StockmanBackend:
                 )
             except Exception as e:
                 logger.error(f"Failed to release hold {hold.hold_id}: {e}")
+                failed.append(hold.hold_id)
 
+        success = len(failed) == 0
         return ReleaseResult(
-            success=True,
+            success=success,
             released=released,
+            message=f"Failed to release holds: {failed}" if failed else None,
         )
 
     @transaction.atomic
@@ -431,6 +435,7 @@ class StockmanBackend:
 # ══════════════════════════════════════════════════════════════
 
 
+_lock = threading.Lock()
 _backend_instance: StockmanBackend | None = None
 
 
@@ -453,6 +458,14 @@ def get_stock_backend(
         return StockmanBackend(product_resolver=product_resolver)
 
     if _backend_instance is None:
-        _backend_instance = StockmanBackend()
+        with _lock:
+            if _backend_instance is None:  # double-checked
+                _backend_instance = StockmanBackend()
 
     return _backend_instance
+
+
+def reset_stock_backend() -> None:
+    """Reset singleton (for tests)."""
+    global _backend_instance
+    _backend_instance = None

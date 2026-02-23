@@ -20,6 +20,7 @@ If PRODUCT_INFO_BACKEND is not configured, get_product_info_backend() raises Imp
 from __future__ import annotations
 
 import logging
+import threading
 from typing import TYPE_CHECKING
 
 from django.conf import settings
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 # Cached backend instance
+_lock = threading.Lock()
 _product_info_backend: ProductInfoBackend | None = None
 
 
@@ -51,23 +53,25 @@ def get_product_info_backend() -> ProductInfoBackend:
     global _product_info_backend
 
     if _product_info_backend is None:
-        craftsman_settings = getattr(settings, "CRAFTSMAN", {})
-        backend_path = craftsman_settings.get("PRODUCT_INFO_BACKEND")
+        with _lock:
+            if _product_info_backend is None:  # double-checked
+                craftsman_settings = getattr(settings, "CRAFTSMAN", {})
+                backend_path = craftsman_settings.get("PRODUCT_INFO_BACKEND")
 
-        if not backend_path:
-            raise ImproperlyConfigured(
-                "CRAFTSMAN['PRODUCT_INFO_BACKEND'] must be configured. "
-                "Example: 'offerman.adapters.product_info.OffermanProductInfoBackend'"
-            )
+                if not backend_path:
+                    raise ImproperlyConfigured(
+                        "CRAFTSMAN['PRODUCT_INFO_BACKEND'] must be configured. "
+                        "Example: 'offerman.adapters.product_info.OffermanProductInfoBackend'"
+                    )
 
-        try:
-            backend_class = import_string(backend_path)
-            _product_info_backend = backend_class()
-            logger.debug("Loaded product info backend: %s", backend_path)
-        except ImportError as e:
-            raise ImproperlyConfigured(
-                f"Failed to import product info backend '{backend_path}': {e}"
-            ) from e
+                try:
+                    backend_class = import_string(backend_path)
+                    _product_info_backend = backend_class()
+                    logger.debug("Loaded product info backend: %s", backend_path)
+                except ImportError as e:
+                    raise ImproperlyConfigured(
+                        f"Failed to import product info backend '{backend_path}': {e}"
+                    ) from e
 
     return _product_info_backend
 

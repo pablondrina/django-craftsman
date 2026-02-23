@@ -2,7 +2,7 @@
 Craftsman Service (v2.3) - Thin wrapper over models.
 
 ✅ LÓGICA DE NEGÓCIO ESTÁ NOS MODELOS (SIREL principle)
-Esta classe é um thin wrapper para conveniência e compatibilidade.
+Esta classe é um thin wrapper para conveniência.
 
 Usage:
     from craftsman import craft, CraftError
@@ -17,22 +17,18 @@ Usage:
     wo.step("Mixing", 70, user=operador)
     wo.step("Shaping", 74, user=operador)
     wo.step("Baking", 72, user=operador)  # Auto-completes!
-
-    # Or using craft API (deprecated)
-    craft.step(70, wo, "Mixing", user=operador)
 """
 
 import logging
-from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from decimal import Decimal
 
-from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
 
+from craftsman.conf import get_setting
 from craftsman.exceptions import CraftError
 from craftsman.models import (
     Plan,
@@ -42,45 +38,9 @@ from craftsman.models import (
     WorkOrder,
     WorkOrderStatus,
 )
+from craftsman.results import InputShortage, ScheduleResult
 
 logger = logging.getLogger(__name__)
-
-
-# ══════════════════════════════════════════════════════════════
-# RESULT TYPES
-# ══════════════════════════════════════════════════════════════
-
-
-@dataclass
-class InputShortage:
-    """Informação sobre insumo insuficiente."""
-
-    sku: str
-    required: Decimal
-    available: Decimal
-
-    @property
-    def shortage(self) -> Decimal:
-        return self.required - self.available
-
-
-@dataclass
-class ScheduleResult:
-    """
-    Resultado do agendamento de produção.
-
-    Se success=True: work_orders contém as ordens criadas
-    Se success=False: errors contém os insumos faltantes
-    """
-
-    success: bool
-    work_orders: list[WorkOrder] = field(default_factory=list)
-    errors: list[InputShortage] = field(default_factory=list)
-    message: str | None = None
-
-    @property
-    def has_shortages(self) -> bool:
-        return len(self.errors) > 0
 
 
 class Craft:
@@ -197,15 +157,16 @@ class Craft:
         """
         Transforma plano aprovado em WorkOrders.
 
+        Delega ao Plan.schedule() que é a fonte única de verdade.
         Se CRAFTSMAN_RESERVE_INPUTS estiver habilitado (e skip_reservation=False),
-        verifica disponibilidade e reserva os insumos antes de criar as WorkOrders.
+        usa fluxo com reserva de materiais.
 
         Args:
             production_date: Data do plano
             start_time: Horário de início (opcional)
             location: Local de produção (opcional)
             user: Usuário que agendou
-            skip_reservation: Se True, ignora reserva de insumos (comportamento legado)
+            skip_reservation: Se True, ignora reserva de insumos
 
         Returns:
             ScheduleResult com work_orders ou errors
@@ -217,69 +178,16 @@ class Craft:
                 "PLAN_NOT_FOUND_OR_NOT_APPROVED", date=str(production_date)
             )
 
-        # Verificar se reserva está habilitada
-        reserve_inputs = getattr(settings, "CRAFTSMAN_RESERVE_INPUTS", False)
+        reserve_inputs = get_setting("RESERVE_INPUTS", False)
 
         if reserve_inputs and not skip_reservation:
             return cls._schedule_with_reservation(
                 plan, production_date, start_time, location, user
             )
-        else:
-            return cls._schedule_without_reservation(
-                plan, production_date, start_time, location, user
-            )
 
-    @classmethod
-    def _schedule_without_reservation(
-        cls,
-        plan: Plan,
-        production_date: date,
-        start_time: time = None,
-        location=None,
-        user=None,
-    ) -> ScheduleResult:
-        """Agendamento sem reserva de insumos (comportamento legado)."""
-        work_orders = []
-
-        with transaction.atomic():
-            for item in plan.items.all():
-                if item.quantity <= 0:
-                    continue
-
-                scheduled_start = None
-                if start_time:
-                    scheduled_start = datetime.combine(production_date, start_time)
-                    if timezone.is_naive(scheduled_start):
-                        scheduled_start = timezone.make_aware(scheduled_start)
-
-                wo = WorkOrder.objects.create(
-                    plan_item=item,
-                    recipe=item.recipe,
-                    planned_quantity=item.quantity,
-                    status=WorkOrderStatus.PENDING,
-                    destination=item.destination,
-                    location=location or item.recipe.work_center,
-                    scheduled_start=scheduled_start,
-                    created_by=f"user:{user.username}" if user else "system:scheduler",
-                    metadata={
-                        "scheduled_by": user.username if user else None,
-                        "reservation_mode": "disabled",
-                    },
-                )
-                work_orders.append(wo)
-
-            plan.status = PlanStatus.SCHEDULED
-            plan.scheduled_at = timezone.now()
-            plan.save(update_fields=["status", "scheduled_at"])
-
-        logger.info(
-            f"Scheduled {len(work_orders)} work orders for {production_date} (no reservation)",
-            extra={
-                "date": str(production_date),
-                "work_orders": len(work_orders),
-            },
+        work_orders = plan.schedule(
+            user=user, reserve_inputs=False, start_time=start_time, location=location,
         )
-
         return ScheduleResult(success=True, work_orders=work_orders)
 
     @classmethod
@@ -402,7 +310,7 @@ class Craft:
                     # Rollback acontece automaticamente pela transação
                     logger.error(
                         f"Failed to reserve materials for WO {wo.code}",
-                        extra={"work_order": wo.code, "message": reserve_result.message},
+                        extra={"work_order": wo.code, "reason": reserve_result.message},
                     )
                     raise CraftError(
                         "RESERVATION_FAILED",
@@ -469,37 +377,6 @@ class Craft:
     # ══════════════════════════════════════════════════════════════
 
     @classmethod
-    def step(
-        cls,
-        quantity: Decimal | int | float,
-        work_order: WorkOrder,
-        step_name: str,
-        user=None,
-    ) -> WorkOrder:
-        """
-        ⚠️ DEPRECATED: Use work.step() diretamente.
-
-        Registra etapa de produção.
-        Mantido apenas para compatibilidade com código legado.
-
-        Prefira:
-            work.step("Mixing", 70, user=operador)
-
-        Em vez de:
-            craft.step(70, work, "Mixing", user=operador)
-        """
-        import warnings
-
-        warnings.warn(
-            "craft.step() is deprecated. Use work.step() directly.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        work_order.step(step_name, quantity, user)
-        work_order.refresh_from_db()
-        return work_order
-
-    @classmethod
     def complete(
         cls,
         work_order: WorkOrder,
@@ -537,7 +414,7 @@ class Craft:
         # Emit materials_needed signal
         from craftsman.signals import materials_needed
 
-        requirements = cls._calculate_material_requirements(work_order)
+        requirements = work_order._calculate_requirements()
         materials_needed.send(
             sender=cls, work_order=work_order, requirements=requirements
         )
@@ -568,7 +445,7 @@ class Craft:
         return work_order
 
     # ══════════════════════════════════════════════════════════════
-    # LEGACY METHODS (backward compatibility)
+    # DIRECT CREATION (without MPS plan flow)
     # ══════════════════════════════════════════════════════════════
 
     @classmethod
@@ -585,23 +462,21 @@ class Craft:
         notes: str = "",
     ) -> WorkOrder:
         """
-        Create work order (legacy API).
+        Create a work order directly (without MPS plan flow).
 
-        ⚠️ Prefer using plan() + schedule() for proper MPS flow.
+        For full MPS flow, use plan() + schedule() instead.
         """
         quantity = Decimal(str(quantity))
 
         if quantity <= 0:
             raise CraftError("INVALID_QUANTITY", quantity=float(quantity))
 
-        # Calculate scheduled_end if scheduled_start and duration provided
         scheduled_end = None
         if scheduled_start and recipe.duration_minutes:
             from datetime import timedelta
 
             scheduled_end = scheduled_start + timedelta(minutes=recipe.duration_minutes)
 
-        # Handle source GenericForeignKey
         source_type = None
         source_id = None
         if source is not None:
@@ -609,7 +484,7 @@ class Craft:
             source_id = source.pk
 
         wo = WorkOrder.objects.create(
-            code=code or "",  # Will be auto-generated if empty
+            code=code or "",
             recipe=recipe,
             planned_quantity=quantity,
             status=WorkOrderStatus.PENDING,
@@ -644,11 +519,7 @@ class Craft:
         location=None,
         assigned_to=None,
     ) -> list[WorkOrder]:
-        """
-        Create multiple WorkOrders for a production day (legacy API).
-
-        ⚠️ Prefer using plan() + schedule() for proper MPS flow.
-        """
+        """Create multiple WorkOrders for a production day."""
         if start_time is None:
             start_time = time(6, 0)
 
@@ -745,25 +616,3 @@ class Craft:
 
         return list(qs.order_by("started_at"))
 
-    # ══════════════════════════════════════════════════════════════
-    # INTERNALS
-    # ══════════════════════════════════════════════════════════════
-
-    @classmethod
-    def _calculate_material_requirements(cls, work_order: WorkOrder) -> list[dict]:
-        """Calculate material requirements for a work order."""
-        recipe = work_order.recipe
-        multiplier = work_order.planned_quantity / recipe.output_quantity
-
-        requirements = []
-
-        for inp in recipe.items.filter(is_active=True):
-            requirements.append(
-                {
-                    "product": inp.item,
-                    "quantity": inp.quantity * multiplier,
-                    "position": inp.position,
-                }
-            )
-
-        return requirements

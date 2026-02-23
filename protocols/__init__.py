@@ -22,6 +22,7 @@ from craftsman.protocols.product import (
     ProductInfoBackend,
     SkuValidationResult,
 )
+from craftsman.protocols.demand import DemandBackend
 
 __all__ = [
     # Stock Protocol
@@ -42,4 +43,6 @@ __all__ = [
     "ProductInfoBackend",
     "ProductInfo",
     "SkuValidationResult",
+    # Demand Protocol
+    "DemandBackend",
 ]

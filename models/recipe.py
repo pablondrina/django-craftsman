@@ -12,9 +12,12 @@ from decimal import Decimal
 
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 from simple_history.models import HistoricalRecords
+
+from craftsman.conf import get_position_model_string
 
 
 class IngredientCategory(models.Model):
@@ -44,8 +47,8 @@ class IngredientCategory(models.Model):
 
     class Meta:
         db_table = "craftsman_ingredient_category"
-        verbose_name = _("Categoria de Insumo")
-        verbose_name_plural = _("Categorias de Insumos")
+        verbose_name = _("Categoria de Ingrediente")
+        verbose_name_plural = _("Categorias de Ingredientes")
         ordering = ["sort_order", "name"]
 
     def __str__(self) -> str:
@@ -61,7 +64,7 @@ class Recipe(models.Model):
     - Quantidade produzida por lote
     - Centro de trabalho (Position)
     - Lead time (dias antes da target_date)
-    - Etapas de produção (production_stages)
+    - Etapas de produção (steps)
     """
 
     # UUID for external references
@@ -106,9 +109,9 @@ class Recipe(models.Model):
         help_text=_("Quantidade produzida por execução da receita"),
     )
 
-    # Work center (Position with type='workstation')
+    # Work center (Position)
     work_center = models.ForeignKey(
-        "stockman.Position",
+        get_position_model_string(),
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -124,8 +127,8 @@ class Recipe(models.Model):
         help_text=_("Dias de antecedência para iniciar produção"),
     )
 
-    # Production stages (list of step names)
-    production_stages = models.JSONField(
+    # Production steps
+    steps = models.JSONField(
         default=list,
         blank=True,
         verbose_name=_("Etapas de Produção"),
@@ -138,7 +141,7 @@ class Recipe(models.Model):
         help_text=_("Receita pode ser usada para novas ordens"),
     )
 
-    # Estimated time (kept for backward compatibility)
+    # Estimated time
     duration_minutes = models.PositiveIntegerField(
         null=True,
         blank=True,
@@ -151,17 +154,16 @@ class Recipe(models.Model):
         verbose_name=_("Observações"),
     )
 
-    # Flexibility (deprecated, use production_stages instead)
+    # Flexibility
     metadata = models.JSONField(
         default=dict,
         blank=True,
         verbose_name=_("Metadados"),
-        help_text=_("Dados adicionais (legado)"),
     )
 
     # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=_("criado em"))
+    updated_at = models.DateTimeField(auto_now=True, verbose_name=_("atualizado em"))
 
     # History
     history = HistoricalRecords()
@@ -177,56 +179,47 @@ class Recipe(models.Model):
             models.Index(fields=["output_type", "output_id"]),
         ]
 
+    def clean(self):
+        super().clean()
+        if self.output_quantity is not None and self.output_quantity <= 0:
+            raise ValidationError({
+                "output_quantity": _("Deve ser maior que zero.")
+            })
+        if self.steps and not isinstance(self.steps, list):
+            raise ValidationError({
+                "steps": _("Deve ser uma lista de nomes de etapas.")
+            })
+        if self.steps:
+            for i, s in enumerate(self.steps):
+                if not isinstance(s, str) or not s.strip():
+                    raise ValidationError({
+                        "steps": _(f"Etapa {i+1} deve ser uma string não-vazia.")
+                    })
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
     def __str__(self) -> str:
         return f"{self.name} ({self.output_quantity}x)"
 
-    @property
-    def steps(self) -> list[str]:
-        """Get production stages as list of step names."""
-        # Try production_stages first, fallback to metadata.steps
-        if self.production_stages:
-            return self.production_stages
-
-        # Fallback to old metadata format
-        old_steps = self.metadata.get("steps", [])
-        if old_steps:
-            return [s["name"] if isinstance(s, dict) else s for s in old_steps]
-
+    def get_steps(self) -> list[str]:
+        """Get step names as a list of strings."""
+        if self.steps:
+            return list(self.steps)
         return []
-
-    @property
-    def required_steps(self) -> list[str]:
-        """Get names of required steps (all steps are required by default)."""
-        # For production_stages, all are required
-        if self.production_stages:
-            return self.production_stages
-
-        # Fallback to old format
-        old_steps = self.metadata.get("steps", [])
-        return [
-            s["name"]
-            for s in old_steps
-            if isinstance(s, dict) and s.get("required", True)
-        ]
 
     def get_step(self, name: str) -> dict | None:
         """Get step configuration by name."""
-        # For production_stages, return simple dict
-        if name in self.production_stages:
+        if name in (self.steps or []):
             return {"name": name, "required": True}
-
-        # Fallback to old format
-        for step in self.metadata.get("steps", []):
-            if isinstance(step, dict) and step.get("name") == name:
-                return step
-
         return None
 
     @property
     def last_step(self) -> str | None:
         """Get last step name."""
-        stages = self.steps
-        return stages[-1] if stages else None
+        steps = self.steps or []
+        return steps[-1] if steps else None
 
 
 class RecipeItem(models.Model):
@@ -286,9 +279,9 @@ class RecipeItem(models.Model):
         help_text=_("kg, L, un, g..."),
     )
 
-    # Where to get (Stockman integration)
+    # Where to get this material from
     position = models.ForeignKey(
-        "stockman.Position",
+        get_position_model_string(),
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -321,8 +314,8 @@ class RecipeItem(models.Model):
 
     class Meta:
         db_table = "craftsman_recipe_item"
-        verbose_name = _("Item da Receita")
-        verbose_name_plural = _("Itens da Receita")
+        verbose_name = _("Ingrediente")
+        verbose_name_plural = _("Ingredientes")
         ordering = ["recipe", "category", "id"]
         indexes = [
             models.Index(fields=["recipe"]),
@@ -334,7 +327,3 @@ class RecipeItem(models.Model):
     def __str__(self) -> str:
         unit_str = f" {self.unit}" if self.unit else ""
         return f"{self.item} ({self.quantity}{unit_str})"
-
-
-# Alias for backward compatibility
-RecipeInput = RecipeItem

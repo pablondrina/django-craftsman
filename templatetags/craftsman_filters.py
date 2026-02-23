@@ -13,5 +13,5 @@ def weight(value):
     try:
         d = Decimal(str(value)).quantize(Decimal("0.01"))
         return f"{d:,}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
+    except (TypeError, ValueError, ArithmeticError):
         return str(value)

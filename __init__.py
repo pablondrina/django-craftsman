@@ -36,11 +36,11 @@ def __getattr__(name):
 
         return Craft
     if name == "ScheduleResult":
-        from craftsman.service import ScheduleResult
+        from craftsman.results import ScheduleResult
 
         return ScheduleResult
     if name == "InputShortage":
-        from craftsman.service import InputShortage
+        from craftsman.results import InputShortage
 
         return InputShortage
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

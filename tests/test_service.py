@@ -11,12 +11,13 @@ from django.core.exceptions import ValidationError
 from django.utils import timezone
 
 from craftsman import craft, CraftError
+from craftsman.conf import get_position_model
 from craftsman.models import (
     Plan,
     PlanItem,
     PlanStatus,
     Recipe,
-    RecipeInput,
+    RecipeItem,
     WorkOrder,
     WorkOrderStatus,
 )
@@ -25,38 +26,45 @@ from craftsman.models import (
 @pytest.fixture
 def product(db):
     """Create a test product."""
-    from catalog.models import Category, Product
+    from offerman.models import Collection, CollectionItem, Product
 
-    category = Category.objects.create(name="Pães", slug="paes")
-    return Product.objects.create(
+    collection = Collection.objects.create(name="Pães", slug="paes")
+    p = Product.objects.create(
+        sku="SVC-CROISSANT-001",
         name="Croissant",
-        slug="croissant",
-        category=category,
-        price=Decimal("5.00"),
+        unit="un",
+        base_price_q=500,
         is_batch_produced=True,
     )
+    CollectionItem.objects.create(collection=collection, product=p, is_primary=True)
+    return p
 
 
 @pytest.fixture
 def position(db):
     """Create or get a test position."""
-    from stockman.models import Position, PositionKind
-
-    position, _ = Position.objects.get_or_create(
-        code="vitrine",
-        defaults={
-            "name": "Vitrine",
+    PositionModel = get_position_model()
+    defaults = {"name": "Vitrine"}
+    # Add stockman-specific fields if available
+    try:
+        from stockman.models import PositionKind
+        defaults.update({
             "kind": PositionKind.PHYSICAL,
             "is_saleable": True,
             "is_default": True,
-        },
+        })
+    except ImportError:
+        pass
+    position, _ = PositionModel.objects.get_or_create(
+        code="vitrine",
+        defaults=defaults,
     )
     return position
 
 
 @pytest.fixture
 def recipe(db, product, position):
-    """Create a test recipe with production_stages."""
+    """Create a test recipe with steps."""
     ct = ContentType.objects.get_for_model(product)
     return Recipe.objects.create(
         code="croissant-v1",
@@ -65,14 +73,14 @@ def recipe(db, product, position):
         output_id=product.pk,
         output_quantity=Decimal("10"),
         duration_minutes=180,
-        production_stages=["Mixing", "Shaping", "Baking"],
+        steps=["Mixing", "Shaping", "Baking"],
         work_center=position,
     )
 
 
 @pytest.fixture
 def recipe_simple(db, product, position):
-    """Create a simple recipe without stages."""
+    """Create a simple recipe without steps."""
     ct = ContentType.objects.get_for_model(product)
     return Recipe.objects.create(
         code="croissant-simple",
@@ -192,20 +200,13 @@ class TestWorkOrderStep:
         assert work.status == WorkOrderStatus.IN_PROGRESS
         assert work.started_at is not None
 
-    def test_step_via_craft_api_deprecated(self, recipe, position):
-        """Test that craft.step() emits deprecation warning."""
-        import warnings
-
+    def test_step_via_model_directly(self, recipe, position):
+        """Test that WorkOrder.step() works directly."""
         work = craft.create(50, recipe, position)
         craft.start(work)
 
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            work = craft.step(50, work, "Mixing")
-
-            assert len(w) == 1
-            assert issubclass(w[0].category, DeprecationWarning)
-            assert "deprecated" in str(w[0].message).lower()
+        work.step("Mixing", 50)
+        work.refresh_from_db()
 
         assert "Mixing" in work.completed_steps
 
@@ -356,9 +357,200 @@ class TestPlanWorkflow:
         plan = craft.get_plan(target_date)
         assert plan.status == PlanStatus.APPROVED
 
-        work_orders = craft.schedule(target_date)
+        result = craft.schedule(target_date)
 
         plan.refresh_from_db()
         assert plan.status == PlanStatus.SCHEDULED
-        assert len(work_orders) == 1
-        assert work_orders[0].planned_quantity == Decimal("50")
+        assert result.success
+        assert len(result.work_orders) == 1
+        assert result.work_orders[0].planned_quantity == Decimal("50")
+
+
+class TestE2ECompleteWorkflow:
+    """
+    End-to-end: plan → approve → schedule → start → step(3x) → complete.
+
+    This verifies the full production lifecycle from planning through
+    execution to completion, including auto-complete on last step.
+    """
+
+    def test_plan_to_complete(self, recipe, product, position):
+        """Full lifecycle: plan → approve → schedule → start → step(3x) → complete."""
+        target_date = date(2025, 12, 25)
+
+        # 1. Plan
+        item = craft.plan(50, product, target_date, position)
+        plan = craft.get_plan(target_date)
+        assert plan.status == PlanStatus.DRAFT
+
+        # 2. Approve
+        craft.approve(target_date)
+        plan.refresh_from_db()
+        assert plan.status == PlanStatus.APPROVED
+
+        # 3. Schedule (creates WorkOrder)
+        result = craft.schedule(target_date)
+        assert result.success
+        assert len(result.work_orders) == 1
+        wo = result.work_orders[0]
+        assert wo.status == WorkOrderStatus.PENDING
+
+        # 4. Start
+        craft.start(wo)
+        wo.refresh_from_db()
+        assert wo.status == WorkOrderStatus.IN_PROGRESS
+        assert wo.started_at is not None
+
+        # 5. Steps (recipe has ["Mixing", "Shaping", "Baking"])
+        wo.step("Mixing", 50)
+        wo.refresh_from_db()
+        assert "Mixing" in wo.completed_steps
+        assert wo.status == WorkOrderStatus.IN_PROGRESS
+
+        wo.step("Shaping", 48)
+        wo.refresh_from_db()
+        assert "Shaping" in wo.completed_steps
+        assert wo.status == WorkOrderStatus.IN_PROGRESS
+
+        # Last step auto-completes
+        wo.step("Baking", 45)
+        wo.refresh_from_db()
+        assert "Baking" in wo.completed_steps
+        assert wo.status == WorkOrderStatus.COMPLETED
+        assert wo.actual_quantity == Decimal("45")
+        assert wo.completed_at is not None
+
+        # Verify loss tracking
+        assert wo.loss_quantity == Decimal("5")
+
+    def test_plan_with_nested_recipe(self, product, position):
+        """BOM multinível: recipe with sub-recipe expands ingredients recursively."""
+        from craftsman.services.ingredients import calculate_daily_ingredients
+        from offerman.models import Collection, CollectionItem, Product
+
+        target_date = date(2025, 12, 26)
+
+        # Create ingredient products
+        collection = Collection.objects.get_or_create(
+            slug="e2e-test", defaults={"name": "E2E Test"}
+        )[0]
+
+        farinha = Product.objects.create(
+            sku="E2E-FARINHA", name="Farinha", unit="kg", base_price_q=500,
+        )
+        CollectionItem.objects.create(collection=collection, product=farinha, is_primary=True)
+
+        agua = Product.objects.create(
+            sku="E2E-AGUA", name="Água", unit="L", base_price_q=0,
+        )
+        CollectionItem.objects.create(collection=collection, product=agua, is_primary=True)
+
+        fermento = Product.objects.create(
+            sku="E2E-FERMENTO", name="Fermento", unit="kg", base_price_q=2000,
+        )
+        CollectionItem.objects.create(collection=collection, product=fermento, is_primary=True)
+
+        # Create "Massa Pão Francês" product (intermediate)
+        massa = Product.objects.create(
+            sku="E2E-MASSA-PAO", name="Massa Pão Francês", unit="kg", base_price_q=0,
+        )
+        CollectionItem.objects.create(collection=collection, product=massa, is_primary=True)
+
+        ct_product = ContentType.objects.get_for_model(Product)
+
+        # Sub-recipe: Massa Pão Francês
+        # Produces 1.96 kg of dough using 1.000 kg flour + 0.680 L water + 0.020 kg yeast
+        sub_recipe = Recipe.objects.create(
+            code="massa-pao-frances-e2e",
+            name="Massa Pão Francês",
+            output_type=ct_product,
+            output_id=massa.pk,
+            output_quantity=Decimal("1.96"),
+        )
+        RecipeItem.objects.create(
+            recipe=sub_recipe,
+            item_type=ct_product,
+            item_id=farinha.pk,
+            quantity=Decimal("1.000"),
+            unit="kg",
+        )
+        RecipeItem.objects.create(
+            recipe=sub_recipe,
+            item_type=ct_product,
+            item_id=agua.pk,
+            quantity=Decimal("0.680"),
+            unit="L",
+        )
+        RecipeItem.objects.create(
+            recipe=sub_recipe,
+            item_type=ct_product,
+            item_id=fermento.pk,
+            quantity=Decimal("0.020"),
+            unit="kg",
+        )
+
+        # Parent recipe: Pão Francês
+        # Produces 20 pães using 0.100 kg of Massa per pão = 2.000 kg total Massa
+        parent_recipe = Recipe.objects.create(
+            code="pao-frances-e2e",
+            name="Pão Francês",
+            output_type=ct_product,
+            output_id=product.pk,
+            output_quantity=Decimal("20"),
+        )
+        # RecipeItem pointing to "Massa Pão Francês" (the product, not the recipe)
+        RecipeItem.objects.create(
+            recipe=parent_recipe,
+            item_type=ct_product,
+            item_id=massa.pk,
+            quantity=Decimal("2.000"),
+            unit="kg",
+        )
+
+        # Plan: 100 pães
+        plan = Plan.objects.create(date=target_date, status=PlanStatus.DRAFT)
+        PlanItem.objects.create(plan=plan, recipe=parent_recipe, quantity=Decimal("100"))
+
+        # Calculate ingredients
+        result = calculate_daily_ingredients(target_date)
+
+        # Coefficient: 100 / 20 = 5 (5 batches of parent recipe)
+        # Massa needed: 2.000 kg * 5 = 10.000 kg
+        # Sub-coefficient: 10.000 / 1.96 ≈ 5.102...
+        # Farinha: 1.000 * 5.102 ≈ 5.102 kg
+        # Água: 0.680 * 5.102 ≈ 3.469 L
+        # Fermento: 0.020 * 5.102 ≈ 0.102 kg
+
+        # Collect all ingredients from all categories
+        all_ingredients = {}
+        for cat_items in result.values():
+            for item in cat_items:
+                all_ingredients[item.item_name] = item
+
+        # Collect all ingredients by checking name contains
+        def _find(substr):
+            for name, item in all_ingredients.items():
+                if substr in name:
+                    return item
+            return None
+
+        # Verify "Massa Pão Francês" was expanded (not listed as raw ingredient)
+        assert _find("Massa Pão Francês") is None, (
+            "Sub-recipe should be expanded, not listed as ingredient"
+        )
+        assert _find("Farinha") is not None, f"Keys: {list(all_ingredients.keys())}"
+        assert _find("Água") is not None
+        assert _find("Fermento") is not None
+
+        # Verify approximate quantities (allow small rounding)
+        farinha_qty = _find("Farinha").total_quantity
+        assert Decimal("5.0") < farinha_qty < Decimal("5.2"), f"Farinha: {farinha_qty}"
+
+        agua_qty = _find("Água").total_quantity
+        assert Decimal("3.4") < agua_qty < Decimal("3.6"), f"Água: {agua_qty}"
+
+        fermento_qty = _find("Fermento").total_quantity
+        assert Decimal("0.1") < fermento_qty < Decimal("0.11"), f"Fermento: {fermento_qty}"
+
+        # Verify used_in trail shows recursive path
+        assert any("Massa Pão Francês" in trail for trail in _find("Farinha").used_in)

@@ -20,6 +20,8 @@ from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from simple_history.models import HistoricalRecords
 
+from craftsman.conf import get_position_model_string
+
 logger = logging.getLogger(__name__)
 User = get_user_model()
 
@@ -116,9 +118,9 @@ class WorkOrder(models.Model):
         verbose_name=_("Status"),
     )
 
-    # Where product goes (DELIVERY) - kept for backward compatibility
+    # Where product goes (delivery)
     destination = models.ForeignKey(
-        "stockman.Position",
+        get_position_model_string(),
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -127,9 +129,9 @@ class WorkOrder(models.Model):
         help_text=_("Onde entregar o produto final"),
     )
 
-    # Where work happens (EXECUTION)
+    # Where work happens (execution)
     location = models.ForeignKey(
-        "stockman.Position",
+        get_position_model_string(),
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -138,7 +140,7 @@ class WorkOrder(models.Model):
         help_text=_("Onde o trabalho acontece (workstation)"),
     )
 
-    # Scheduling (OPTIONAL) - kept for backward compatibility
+    # Scheduling (OPTIONAL)
     scheduled_start = models.DateTimeField(
         null=True,
         blank=True,
@@ -173,7 +175,7 @@ class WorkOrder(models.Model):
         verbose_name=_("Responsável"),
     )
 
-    # Source tracking (Hold, Forecast, Manual...) - kept for backward compatibility
+    # Source tracking (Hold, Forecast, Manual...)
     source_type = models.ForeignKey(
         ContentType,
         on_delete=models.SET_NULL,
@@ -190,28 +192,20 @@ class WorkOrder(models.Model):
     source = GenericForeignKey("source_type", "source_id")
 
     # Step quantities (editable in admin list)
-    mixing = models.DecimalField(
-        max_digits=10,
-        decimal_places=0,
-        null=True,
-        blank=True,
-        verbose_name=_("Massa para"),
-        help_text=_("Quantidade de massa preparada"),
-    )
-    processed_quantity = models.DecimalField(
+    process_quantity = models.DecimalField(
         max_digits=10,
         decimal_places=0,
         null=True,
         blank=True,
         verbose_name=_("Processado"),
-        help_text=_("Quantidade após processamento/modelagem"),
+        help_text=_("Quantidade processada"),
     )
-    produced_quantity = models.DecimalField(
+    output_quantity = models.DecimalField(
         max_digits=10,
         decimal_places=0,
         null=True,
         blank=True,
-        verbose_name=_("Produzido"),
+        verbose_name=_("Saída"),
         help_text=_("Quantidade final produzida"),
     )
 
@@ -273,30 +267,23 @@ class WorkOrder(models.Model):
         return f"WO-{self.pk} - {self.recipe.name}"
 
     def save(self, *args, **kwargs):
-        """Override save to auto-generate code."""
+        """Override save to auto-generate code via atomic sequence."""
         if not self.code:
             self.code = self._generate_code()
         super().save(*args, **kwargs)
 
     def _generate_code(self) -> str:
-        """Generate unique WorkOrder code in format WO-YYYY-NNNNN."""
+        """
+        Generate unique WorkOrder code in format WO-YYYY-NNNNN.
+
+        Uses CodeSequence for atomic, race-condition-free increment.
+        """
+        from craftsman.models.sequence import CodeSequence
+
         year = timezone.now().year
-        prefix = f"WO-{year}-"
-
-        last = (
-            WorkOrder.objects.filter(code__startswith=prefix).order_by("-code").first()
-        )
-
-        if last:
-            try:
-                last_num = int(last.code.split("-")[-1])
-                next_num = last_num + 1
-            except (ValueError, IndexError):
-                next_num = 1
-        else:
-            next_num = 1
-
-        return f"{prefix}{next_num:05d}"
+        prefix = f"WO-{year}"
+        next_num = CodeSequence.next_value(prefix)
+        return f"{prefix}-{next_num:05d}"
 
     # ══════════════════════════════════════════════════════════════
     # BUSINESS LOGIC (encapsulated in model!)
@@ -340,6 +327,13 @@ class WorkOrder(models.Model):
                 _(f"Não é possível registrar etapa para ordem com status {self.status}")
             )
 
+        # Validate step name against recipe
+        steps = self.recipe.steps or []
+        if steps and step_name not in steps:
+            logger.warning(
+                f"WorkOrder {self.code}: step '{step_name}' not in recipe steps {steps}"
+            )
+
         # Start if needed (track for signal emission)
         is_first_step = self.status == WorkOrderStatus.PENDING
 
@@ -361,22 +355,21 @@ class WorkOrder(models.Model):
             }
         )
 
-        # Also save to dedicated fields if step name matches
-        step_lower = step_name.lower()
-        if step_lower in ("mixing", "mistura"):
-            self.mixing = quantity
-        elif step_lower in ("shaping", "modelagem", "processed"):
-            self.processed_quantity = quantity
-        elif step_lower in ("baking", "forneamento", "produced"):
-            self.produced_quantity = quantity
+        # Map step to dedicated field based on position in recipe.steps
+        steps = self.recipe.steps or []
+        if step_name in steps:
+            total = len(steps)
+            idx = steps.index(step_name)
+            if total >= 2 and idx == total - 2:
+                self.process_quantity = quantity
+            if idx == total - 1:
+                self.output_quantity = quantity
 
         update_fields = ["status", "started_at", "metadata", "updated_at"]
-        if self.mixing is not None:
-            update_fields.append("mixing")
-        if self.processed_quantity is not None:
-            update_fields.append("processed_quantity")
-        if self.produced_quantity is not None:
-            update_fields.append("produced_quantity")
+        if self.process_quantity is not None:
+            update_fields.append("process_quantity")
+        if self.output_quantity is not None:
+            update_fields.append("output_quantity")
 
         self.save(update_fields=update_fields)
 
@@ -487,6 +480,12 @@ class WorkOrder(models.Model):
             logger.warning(f"WorkOrder {self.code} already completed")
             return
 
+        allowed = [WorkOrderStatus.PENDING, WorkOrderStatus.IN_PROGRESS, WorkOrderStatus.PAUSED]
+        if self.status not in allowed:
+            raise ValidationError(
+                _(f"Não é possível completar ordem com status '{self.get_status_display()}'")
+            )
+
         self.status = WorkOrderStatus.COMPLETED
         self.actual_quantity = actual_quantity
         self.completed_at = timezone.now()
@@ -580,21 +579,6 @@ class WorkOrder(models.Model):
     # ══════════════════════════════════════════════════════════════
 
     @property
-    def quantity(self) -> Decimal:
-        """Alias for planned_quantity (backward compatibility)."""
-        return self.planned_quantity
-
-    @property
-    def actual_start(self):
-        """Alias for started_at (backward compatibility)."""
-        return self.started_at
-
-    @property
-    def actual_end(self):
-        """Alias for completed_at (backward compatibility)."""
-        return self.completed_at
-
-    @property
     def is_scheduled(self) -> bool:
         """Has scheduled date?"""
         return self.scheduled_start is not None
@@ -628,11 +612,6 @@ class WorkOrder(models.Model):
     def step_log(self) -> list[dict]:
         """Get step log from metadata."""
         return self.metadata.get("step_log", [])
-
-    @property
-    def step_history(self) -> list[dict]:
-        """Alias for step_log."""
-        return self.step_log
 
     @property
     def completed_steps(self) -> list[str]:
